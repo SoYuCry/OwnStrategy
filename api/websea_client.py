@@ -4,32 +4,22 @@ Websea exchange client implementation.
 Validated against https://webseaex.github.io/en/ (Futures Trading & Futures Market docs).
 """
 
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
 import os
-import time
-import math
 import random
 import string
-from typing import Dict, Any, Optional, List
-from decimal import Decimal
-import hashlib
-import hmac
-import json
-import threading
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
-import hashlib
-import asyncio
-import json
+import time
 from decimal import Decimal, ROUND_DOWN
-from typing import Dict, Any, List, Optional, Tuple, Callable
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 import websockets
 
-from .base_client import BaseExchangeClient, OrderResult, OrderInfo, query_retry
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from .base_client import BaseExchangeClient, OrderInfo, OrderResult, query_retry
 from logger import setup_logger
 
 
@@ -121,11 +111,13 @@ class WebseaClient(BaseExchangeClient):
         self.session = requests.Session()
         self.session.headers.update({
             "Accept": "application/json",
-            "User-Agent": "websea-client/1.0"
+            "User-Agent": "websea-client/1.0",
         })
 
-        # 检查config是否有ticker属性
-        ticker = getattr(self.config, 'ticker', None) if hasattr(self.config, 'ticker') else self.config.get('ticker', 'DEFAULT')
+        self.timeout = float(self._config_get("timeout", 10))
+        self.max_retries = int(self._config_get("max_retries", 3))
+
+        ticker = self._config_get("ticker", "DEFAULT")
         self.logger = setup_logger(f"websea_{ticker}")
 
         # Order update via REST polling (since no private WS)
@@ -138,6 +130,12 @@ class WebseaClient(BaseExchangeClient):
 
     # ---------- lifecycle ----------
 
+    def _config_get(self, key: str, default: Any = None) -> Any:
+        if isinstance(self.config, dict):
+            return self.config.get(key, default)
+        return getattr(self.config, key, default)
+
+    
     def _validate_config(self) -> None:
         required_env_vars = ['WEBSEA_TOKEN', 'WEBSEA_SECRET']
         missing = [v for v in required_env_vars if not os.getenv(v)]
@@ -164,63 +162,141 @@ class WebseaClient(BaseExchangeClient):
 
     # ---------- 实现BaseExchangeClient的抽象方法 ----------
 
-    def make_request(self, method: str, endpoint: str, api_key=None, secret_key=None,
-                     instruction=None, params=None, data=None, retry_count: int = 3) -> Dict:
-        """Perform HTTP request and return parsed JSON dict or {'error': ...}."""
-        try:
-            url = self.base_url.rstrip("/") + endpoint
-            
-            # 使用websea的认证方法
-            if method.upper() == "GET":
-                headers = self._auth_headers(params or {})
-                response = self.session.get(url, params=params, headers=headers, timeout=10)
-            elif method.upper() == "POST":
-                headers = self._auth_headers(data or {})
-                headers["Content-Type"] = "application/x-www-form-urlencoded"
-                response = self.session.post(url, data=data, headers=headers, timeout=10)
-            else:
-                return {"error": f"Unsupported method: {method}"}
-            
-            return response.json()
-        except Exception as e:
-            return {"error": str(e)}
+    def make_request(
+        self,
+        method: str,
+        endpoint: str,
+        api_key: Optional[str] = None,
+        secret_key: Optional[str] = None,
+        instruction: Optional[Any] = None,
+        params: Optional[Dict[str, Any]] = None,
+        data: Optional[Dict[str, Any]] = None,
+        retry_count: int = 3,
+    ) -> Dict[str, Any]:
+        """Perform an authenticated HTTP request with retry and error handling."""
+
+        url = f"{self.base_url.rstrip('/')}" + endpoint
+        method_upper = method.upper()
+        query_params = self._prepare_params(params)
+        body_params = self._prepare_params(data)
+        retry_total = max(retry_count or self.max_retries, 1)
+
+        for attempt in range(retry_total):
+            payload = dict(query_params)
+            payload.update(body_params)
+            headers = self._auth_headers(payload)
+            if method_upper not in {"GET", "DELETE"} and body_params:
+                headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+
+            try:
+                response = self.session.request(
+                    method_upper,
+                    url,
+                    params=query_params or None,
+                    data=body_params if method_upper not in {"GET", "DELETE"} else None,
+                    timeout=self.timeout,
+                    headers=headers,
+                )
+
+                if 200 <= response.status_code < 300:
+                    if not response.text:
+                        return {}
+                    try:
+                        return response.json()
+                    except ValueError:
+                        return {
+                            "error": "Invalid JSON response",
+                            "status_code": response.status_code,
+                            "raw": response.text,
+                        }
+
+                if response.status_code == 429:
+                    wait_time = min(1 * (2 ** attempt), 8)
+                    self.logger.warning("Websea API rate limited, retrying in %.1f s", wait_time)
+                    time.sleep(wait_time)
+                    continue
+
+                try:
+                    error_body = response.json()
+                    message = (
+                        error_body.get("errmsg")
+                        or error_body.get("msg")
+                        or error_body.get("message")
+                        or str(error_body)
+                    )
+                except ValueError:
+                    message = response.text or f"HTTP {response.status_code}"
+                    error_body = {"error": message}
+
+                if attempt < retry_total - 1 and response.status_code >= 500:
+                    time.sleep(1)
+                    continue
+
+                return {"error": message, "status_code": response.status_code, "details": error_body}
+
+            except requests.RequestException as exc:
+                if attempt < retry_total - 1:
+                    self.logger.warning("Websea request error (%s), retrying...", exc)
+                    time.sleep(1)
+                    continue
+                return {"error": f"request failed: {exc}"}
+
+        return {"error": "max retries reached"}
 
     # ---------- signing ----------
 
+    def _decimal_to_str(self, value: Decimal) -> str:
+        normalized = value.normalize() if value != 0 else Decimal("0")
+        text = format(normalized, "f")
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        return text or "0"
+
+    def _prepare_params(self, payload: Optional[Dict[str, Any]]) -> Dict[str, str]:
+        if not payload:
+            return {}
+        prepared: Dict[str, str] = {}
+        for key, value in payload.items():
+            if value is None:
+                continue
+            if isinstance(value, Decimal):
+                prepared[key] = self._decimal_to_str(value)
+            elif isinstance(value, bool):
+                prepared[key] = "true" if value else "false"
+            elif isinstance(value, (int, float)):
+                prepared[key] = self._decimal_to_str(Decimal(str(value)))
+            else:
+                prepared[key] = str(value)
+        return prepared
+
     def _make_nonce(self) -> str:
         ts = int(time.time())
-        rand5 = ''.join(random.sample(string.ascii_letters + string.digits, 5))
+        rand5 = "".join(random.choices(string.ascii_lowercase + string.digits, k=5))
         return f"{ts}_{rand5}"
 
-    def _sign(self, nonce: str, params: Dict[str, Any]) -> str:
-        arr = [self.token, self.secret, nonce]
-        for k, v in (params or {}).items():
-            arr.append(f"{str(k)}={str(v)}")
-        arr.sort()
-        return hashlib.sha1(''.join(arr).encode("utf-8")).hexdigest()
+    def _sign(self, nonce: str, payload: Dict[str, str]) -> str:
+        pieces = [self.token, self.secret, nonce]
+        for key, value in (payload or {}).items():
+            pieces.append(f"{key}={value}")
+        signature_base = "".join(sorted(pieces))
+        return hashlib.sha1(signature_base.encode("utf-8")).hexdigest()
 
-    def _auth_headers(self, params: Dict[str, Any]) -> Dict[str, str]:
+    def _auth_headers(self, payload: Dict[str, str]) -> Dict[str, str]:
         nonce = self._make_nonce()
+        signature = self._sign(nonce, payload)
         return {
             "Token": self.token,
             "Nonce": nonce,
-            "Signature": self._sign(nonce, params or {}),
+            "Signature": signature,
         }
 
     # ---------- HTTP helpers ----------
 
-    def _get(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        url = self.base_url.rstrip("/") + path
-        headers = self._auth_headers(params)
-        r = self.session.get(url, params=params, headers=headers, timeout=10)
-        return r.json()
+    def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return self.make_request("GET", path, params=params)
 
-    def _post(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        url = self.base_url.rstrip("/") + path
-        headers = self._auth_headers(params)
-        headers["Content-Type"] = "application/x-www-form-urlencoded"
-        r = self.session.post(url, data=params, headers=headers, timeout=10)
-        return r.json()
+    def _post(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return self.make_request("POST", path, data=params)
 
     # ---------- precision / rounding ----------
 
@@ -614,12 +690,11 @@ class WebseaClient(BaseExchangeClient):
         - 映射状态码到 OPEN/PARTIALLY_FILLED/FILLED/...
         - 回调里带上 contract_id 让 bot 不会丢
         """
-        # 使用基类的回调机制
         self.set_order_update_callback(handler)
         self._poll_interval = poll_interval
         self._known_status: Dict[str, str] = {}
 
-        STATUS_MAP = {
+        status_map = {
             1: "OPEN",
             2: "PARTIALLY_FILLED",
             3: "FILLED",
@@ -638,46 +713,42 @@ class WebseaClient(BaseExchangeClient):
                 return "sell"
             return ot
 
-        # 存储已知订单，用于检测成交
-        self._tracked_orders: Dict[str, Dict] = {}  # order_id -> order_info
+        self._tracked_orders: Dict[str, Dict[str, str]] = {}
 
         async def poll_orders():
             while True:
                 try:
-                    ticker = getattr(self.config, 'ticker', None) if hasattr(self.config, 'ticker') else self.config.get('ticker')
+                    ticker = self._config_get('ticker')
                     if not ticker:
                         await asyncio.sleep(poll_interval)
                         continue
-                        
+
                     current_active_orders = await self.get_active_orders(ticker)
                     current_active_ids = {order.order_id for order in current_active_orders}
-                    
-                    # 检查之前追踪的订单是否消失（可能已成交）
+
                     for order_id in list(self._tracked_orders.keys()):
                         if order_id not in current_active_ids:
-                            # 订单消失了，检查其最终状态
                             detail = self._get("/openApi/contract/getOrderDetail", {"order_id": order_id})
                             if detail and detail.get("errno") == 0:
-                                d = detail.get("result", {}) or {}
-                                status_code = d.get("status", 3)  # 默认假设已成交
+                                info = detail.get("result", {}) or {}
+                                status_code = info.get("status", 3)
                                 try:
                                     status_code = int(status_code)
                                 except Exception:
                                     status_code = 3
-                                
-                                # 如果状态是已成交或已取消，发送最终状态更新
-                                if status_code in [3, 5, 6]:  # FILLED, PARTIALLY_CANCELED, CANCELED
+
+                                if status_code in (3, 5, 6):
                                     prev_order = self._tracked_orders[order_id]
-                                    side = _normalize_side(d.get("type", prev_order.get('side', '')))
-                                    ct = str(d.get("contract_type") or d.get("contractType") or "").lower()
-                                    order_type = "CLOSE" if ct in ("close", "2") else "OPEN"
-                                    status = STATUS_MAP.get(status_code, "FILLED")
-                                    amount = Decimal(str(d.get("amount", prev_order.get('amount', 0))))
-                                    price = Decimal(str(d.get("price", prev_order.get('price', 0))))
-                                    filled = Decimal(str(d.get("deal_amount", 0)))
+                                    side = _normalize_side(info.get("type", prev_order.get("side", "")))
+                                    contract_type = str(info.get("contract_type") or info.get("contractType") or "").lower()
+                                    order_type = "CLOSE" if contract_type in ("close", "2") else "OPEN"
+                                    status = status_map.get(status_code, "FILLED")
+                                    amount = Decimal(str(info.get("amount", prev_order.get("amount", 0))))
+                                    price = Decimal(str(info.get("price", prev_order.get("price", 0))))
+                                    filled = Decimal(str(info.get("deal_amount", 0)))
                                     remaining = amount - filled
-                                    
-                                    contract_id = getattr(self.config, 'contract_id', None) if hasattr(self.config, 'contract_id') else self.config.get('contract_id', ticker)
+
+                                    contract_id = self._config_get('contract_id', ticker)
                                     self._handle_order_update({
                                         "order_id": order_id,
                                         "side": side,
@@ -689,43 +760,39 @@ class WebseaClient(BaseExchangeClient):
                                         "remaining_size": str(remaining),
                                         "contract_id": contract_id,
                                     })
-                                    self.logger.info(f"[Websea] 訂單 {order_id} 最終状态: {status}, 成交: {filled}")
-                            
-                            # 从追踪列表中移除
-                            del self._tracked_orders[order_id]
-                    
-                    # 处理当前活跃订单
+                                    self.logger.info("[Websea] 訂單 %s 最終状态: %s, 成交: %s", order_id, status, filled)
+
+                            self._tracked_orders.pop(order_id, None)
+
                     for order in current_active_orders:
-                        # 添加到追踪列表
                         if order.order_id not in self._tracked_orders:
                             self._tracked_orders[order.order_id] = {
-                                'side': order.side,
-                                'amount': str(order.size),
-                                'price': str(order.price)
+                                "side": order.side,
+                                "amount": str(order.size),
+                                "price": str(order.price),
                             }
-                        
+
                         detail = self._get("/openApi/contract/getOrderDetail", {"order_id": order.order_id})
                         if detail and detail.get("errno") == 0:
-                            d = detail.get("result", {}) or {}
-                            side = _normalize_side(d.get("type", order.side))
-                            ct = str(d.get("contract_type") or d.get("contractType") or "").lower()
-                            order_type = "CLOSE" if ct in ("close", "2") else "OPEN"
-                            status_code = d.get("status", 1)
+                            info = detail.get("result", {}) or {}
+                            side = _normalize_side(info.get("type", order.side))
+                            contract_type = str(info.get("contract_type") or info.get("contractType") or "").lower()
+                            order_type = "CLOSE" if contract_type in ("close", "2") else "OPEN"
+                            status_code = info.get("status", 1)
                             try:
                                 status_code = int(status_code)
                             except Exception:
                                 status_code = 1
-                            status = STATUS_MAP.get(status_code, "OPEN")
-                            amount = Decimal(str(d.get("amount", order.size or 0)))
-                            price = Decimal(str(d.get("price", order.price or 0)))
-                            filled = Decimal(str(d.get("deal_amount", order.filled_size or 0)))
+                            status = status_map.get(status_code, "OPEN")
+                            amount = Decimal(str(info.get("amount", order.size or 0)))
+                            price = Decimal(str(info.get("price", order.price or 0)))
+                            filled = Decimal(str(info.get("deal_amount", order.filled_size or 0)))
                             remaining = amount - filled
 
                             prev_status = self._known_status.get(order.order_id)
                             if prev_status != status:
                                 self._known_status[order.order_id] = status
-                                # 使用基类的回调机制
-                                contract_id = getattr(self.config, 'contract_id', None) if hasattr(self.config, 'contract_id') else self.config.get('contract_id', ticker)
+                                contract_id = self._config_get('contract_id', ticker)
                                 self._handle_order_update({
                                     "order_id": order.order_id,
                                     "side": side,
@@ -737,23 +804,20 @@ class WebseaClient(BaseExchangeClient):
                                     "remaining_size": str(remaining),
                                     "contract_id": contract_id,
                                 })
-                except Exception as e:
-                    self.logger.error(f"[Websea] poll_orders error: {e}")
+                except Exception as exc:
+                    self.logger.error(f"[Websea] poll_orders error: {exc}")
 
                 await asyncio.sleep(poll_interval)
 
-        # 存储轮询函数，稍后在异步上下文中启动
         self._poll_orders_func = poll_orders
 
-    def start_order_polling(self):
+    def start_order_polling(self) -> None:
         """在异步上下文中启动订单轮询"""
         if hasattr(self, '_poll_orders_func') and not self._poll_task:
             try:
                 self._poll_task = asyncio.create_task(self._poll_orders_func())
             except RuntimeError:
-                # 如果没有运行的事件循环，记录但不抛出异常
                 self.logger.warning("No running event loop, order polling will start when strategy runs")
-                pass
 
     # ---------- 添加与策略兼容的方法 ----------
     

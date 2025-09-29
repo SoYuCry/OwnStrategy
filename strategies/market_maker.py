@@ -132,11 +132,6 @@ class MarketMaker:
         if exchange == 'backpack':
             self.ws = BackpackWebSocket(api_key, secret_key, symbol, self.on_ws_message, auto_reconnect=True, proxy=self.ws_proxy)
             self.ws.connect()
-        elif exchange == 'websea':
-            # Websea 使用轮询方式获取订单更新
-            self.ws = None
-            # 设置订单状态更新处理器 - 使用通用回调，缩短轮询间隔以更及时捕获成交
-            self.client.setup_order_update_handler(self.on_order_update, poll_interval=1.5)
         else:
             self.ws = None  # 不使用WebSocket
         # 执行绪池用于后台任务
@@ -1645,15 +1640,6 @@ class MarketMaker:
     
     def run(self, duration_seconds=3600, interval_seconds=60):
         """执行做市策略"""
-        logger.info(f"开始运行做市策略: {self.symbol}")
-        logger.info(f"运行时间: {duration_seconds} 秒, 间隔: {interval_seconds} 秒")
-        # 为websea启动订单轮询（如果还没有启动）
-        if self.exchange == 'websea' and hasattr(self.client, 'start_order_polling'):
-            try:
-                self.client.start_order_polling()
-                logger.info("确保Websea订单轮询已启动")
-            except Exception as e:
-                logger.debug(f"订单轮询启动状态: {e}")
         
         # 打印重平设置
         logger.info(f"重平功能: {'开启' if self.enable_rebalance else '关闭'}")
