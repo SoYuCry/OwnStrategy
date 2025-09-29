@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import math
+import random
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -34,6 +35,7 @@ class PerpetualMarketMaker(MarketMaker):
         ws_proxy: Optional[str] = None,
         exchange: str = 'backpack',
         exchange_config: Optional[Dict[str, Any]] = None,
+        volume_noise_pct: float = 0.1,
         **kwargs,
     ) -> None:
         """
@@ -49,6 +51,7 @@ class PerpetualMarketMaker(MarketMaker):
             inventory_skew (float): 库存偏移，影响报价的不对称性，以将净仓位推向0。
             leverage (float): 杠杆倍数。
             ws_proxy (Optional[str]): WebSocket代理地址。
+            volume_noise_pct (float): 挂单数量随机扰动百分比（0.1 表示上下10%）。
         """
         kwargs.setdefault("enable_rebalance", False)
         super().__init__(
@@ -67,6 +70,7 @@ class PerpetualMarketMaker(MarketMaker):
         self.position_threshold = max(position_threshold, self.min_order_size)
         self.inventory_skew = max(0.0, min(1.0, inventory_skew))
         self.leverage = max(1.0, leverage)
+        self.order_quantity_noise_pct = max(0.0, volume_noise_pct)
 
         self.position_state: Dict[str, Any] = {
             "net": 0.0,
@@ -338,8 +342,24 @@ class PerpetualMarketMaker(MarketMaker):
         super().run(duration_seconds, interval_seconds)
 
     # ------------------------------------------------------------------
-    # 下单相关 (此处函数未变动)
+    # 下单相关
     # ------------------------------------------------------------------
+    def adjust_order_quantity(self, base_quantity: float, side: str, price: float) -> float:  # type: ignore[override]
+        if self.order_quantity_noise_pct <= 0:
+            return base_quantity
+
+        noise_ratio = random.uniform(-self.order_quantity_noise_pct, self.order_quantity_noise_pct)
+        adjusted = base_quantity * (1.0 + noise_ratio)
+        adjusted = max(self.min_order_size, round_to_precision(adjusted, self.base_precision))
+        logger.debug(
+            "订单数量噪声(%s): 基础=%s, 噪声比例=%.4f, 调整后=%s",
+            side,
+            format_balance(base_quantity),
+            noise_ratio,
+            format_balance(adjusted),
+        )
+        return adjusted
+
     def open_position(
         self,
         side: str,
