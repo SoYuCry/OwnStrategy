@@ -142,10 +142,17 @@ def main():
             if market_type == 'perp':
                 logger.info("启动永续合约做市模式")
                 logger.info(f"启动永续合约做市模式 (交易所: {exchange})")
+                logger.info(f"  交易对: {args.symbol}")
+                logger.info(f"  价差百分比: {args.spread}")
+                logger.info(f"  订单数量: {args.quantity}")
+                logger.info(f"  每侧最大订单数量: {args.max_orders}")
                 logger.info(f"  目标持仓量: {abs(args.target_position)}")
                 logger.info(f"  最大持仓量: {args.max_position}")
                 logger.info(f"  仓位触发值: {args.position_threshold}")
                 logger.info(f"  报价偏移系数: {args.inventory_skew}")
+                logger.info(f"  运行时间（秒）: {args.duration}")
+                logger.info(f"  更新间隔（秒）: {args.interval}")
+                logger.info(f"  WebSocket Proxy: {ws_proxy}")
 
                 market_maker = PerpetualMarketMaker(
                     api_key=api_key,

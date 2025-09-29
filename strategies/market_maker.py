@@ -132,11 +132,6 @@ class MarketMaker:
         if exchange == 'backpack':
             self.ws = BackpackWebSocket(api_key, secret_key, symbol, self.on_ws_message, auto_reconnect=True, proxy=self.ws_proxy)
             self.ws.connect()
-        elif exchange == 'websea':
-            # Websea 使用轮询方式获取订单更新
-            self.ws = None
-            # 设置订单状态更新处理器 - 使用通用回调，缩短轮询间隔以更及时捕获成交
-            self.client.setup_order_update_handler(self.on_order_update, poll_interval=1.5)
         else:
             self.ws = None  # 不使用WebSocket
         # 执行绪池用于后台任务
@@ -1214,50 +1209,68 @@ class MarketMaker:
             logger.info(f"已经订阅了订单更新: {stream}")
             return True
     
+    def determine_order_sizes(self, buy_prices: List[float], sell_prices: List[float]) -> Tuple[float, float]:
+        """根据账户余额或固定配置计算买卖订单数量。"""
+        if self.order_quantity is None:
+            base_available, base_total = self.get_asset_balance(self.base_asset)
+            quote_available, quote_total = self.get_asset_balance(self.quote_asset)
+
+            logger.info(f"当前总余额: {format_balance(base_total)} {self.base_asset}, {format_balance(quote_total)} {self.quote_asset}")
+            logger.info(f"当前可用余额: {format_balance(base_available)} {self.base_asset}, {format_balance(quote_available)} {self.quote_asset}")
+
+            if base_total > 0 and base_available < base_total * 0.1:
+                logger.info("基础资产主要在抵押品中，将依靠自动赎回功能")
+            if quote_total > 0 and quote_available < quote_total * 0.1:
+                logger.info("报价资产主要在抵押品中，将依靠自动赎回功能")
+
+            avg_price = sum(buy_prices) / len(buy_prices)
+
+            allocation_percent = min(0.05, 1.0 / (self.max_orders * 4))
+
+            quote_amount_per_side = quote_total * allocation_percent
+            base_amount_per_side = base_total * allocation_percent
+
+            buy_quantity = max(
+                self.min_order_size,
+                round_to_precision(quote_amount_per_side / avg_price, self.base_precision),
+            )
+            sell_quantity = max(
+                self.min_order_size,
+                round_to_precision(base_amount_per_side, self.base_precision),
+            )
+
+            logger.info(
+                f"计算订单数量: 买单 {format_balance(buy_quantity)} {self.base_asset}, "
+                f"卖单 {format_balance(sell_quantity)} {self.base_asset}"
+            )
+        else:
+            buy_quantity = max(
+                self.min_order_size,
+                round_to_precision(self.order_quantity, self.base_precision),
+            )
+            sell_quantity = max(
+                self.min_order_size,
+                round_to_precision(self.order_quantity, self.base_precision),
+            )
+
+        return buy_quantity, sell_quantity
+
+    def adjust_order_quantity(self, base_quantity: float, side: str, price: float) -> float:
+        """在派单前调整数量，默认不做改动。"""
+        return base_quantity
+
     def place_limit_orders(self):
         """下限价单（使用总余额包含抵押品）"""
         self.check_ws_connection()
         self.cancel_existing_orders()
-        
+
         buy_prices, sell_prices = self.calculate_prices()
         if buy_prices is None or sell_prices is None:
             logger.error("无法计算订单价格，跳过下单")
             return
-        
-        # 处理订单数量
-        if self.order_quantity is None:
-            # 获取总可用余额（包含抵押品）
-            base_available, base_total = self.get_asset_balance(self.base_asset)
-            quote_available, quote_total = self.get_asset_balance(self.quote_asset)
-            
-            logger.info(f"当前总余额: {format_balance(base_total)} {self.base_asset}, {format_balance(quote_total)} {self.quote_asset}")
-            logger.info(f"当前可用余额: {format_balance(base_available)} {self.base_asset}, {format_balance(quote_available)} {self.quote_asset}")
-            
-            # 如果可用余额很少但总余额充足，说明资金在抵押品中
-            if base_available < base_total * 0.1:
-                logger.info(f"基础资产主要在抵押品中，将依靠自动赎回功能")
-            if quote_available < quote_total * 0.1:
-                logger.info(f"报价资产主要在抵押品中，将依靠自动赎回功能")
-            
-            # 计算每个订单的数量
-            avg_price = sum(buy_prices) / len(buy_prices)
-            
-            # 使用更保守的分配比例，避免资金用尽
-            allocation_percent = min(0.05, 1.0 / (self.max_orders * 4))  # 最多使用总资金的25%
-            
-            # 基于总余额计算，而不是可用余额
-            quote_amount_per_side = quote_total * allocation_percent
-            base_amount_per_side = base_total * allocation_percent
-            
-            buy_quantity = max(self.min_order_size, round_to_precision(quote_amount_per_side / avg_price, self.base_precision))
-            sell_quantity = max(self.min_order_size, round_to_precision(base_amount_per_side, self.base_precision))
-            
-            logger.info(f"计算订单数量: 买单 {format_balance(buy_quantity)} {self.base_asset}, 卖单 {format_balance(sell_quantity)} {self.base_asset}")
-        else:
-            # 真实的 SOL 数量
-            buy_quantity = max(self.min_order_size, round_to_precision(self.order_quantity, self.base_precision))
-            sell_quantity = max(self.min_order_size, round_to_precision(self.order_quantity, self.base_precision))
-        
+
+        buy_quantity, sell_quantity = self.determine_order_sizes(buy_prices, sell_prices)
+
         # 下买单 (并发处理)
         buy_futures = []
 
@@ -1289,7 +1302,8 @@ class MarketMaker:
             for p in buy_prices:
                 if len(buy_futures) >= self.max_orders:
                     break
-                buy_futures.append(executor.submit(place_buy, p, buy_quantity))
+                qty_for_order = self.adjust_order_quantity(buy_quantity, "Bid", p)
+                buy_futures.append(executor.submit(place_buy, p, qty_for_order))
 
         buy_order_count = 0
         for future in buy_futures:
@@ -1333,7 +1347,8 @@ class MarketMaker:
             for p in sell_prices:
                 if len(sell_futures) >= self.max_orders:
                     break
-                sell_futures.append(executor.submit(place_sell, p, sell_quantity))
+                qty_for_order = self.adjust_order_quantity(sell_quantity, "Ask", p)
+                sell_futures.append(executor.submit(place_sell, p, qty_for_order))
 
         sell_order_count = 0
         for future in sell_futures:
@@ -1645,15 +1660,6 @@ class MarketMaker:
     
     def run(self, duration_seconds=3600, interval_seconds=60):
         """执行做市策略"""
-        logger.info(f"开始运行做市策略: {self.symbol}")
-        logger.info(f"运行时间: {duration_seconds} 秒, 间隔: {interval_seconds} 秒")
-        # 为websea启动订单轮询（如果还没有启动）
-        if self.exchange == 'websea' and hasattr(self.client, 'start_order_polling'):
-            try:
-                self.client.start_order_polling()
-                logger.info("确保Websea订单轮询已启动")
-            except Exception as e:
-                logger.debug(f"订单轮询启动状态: {e}")
         
         # 打印重平设置
         logger.info(f"重平功能: {'开启' if self.enable_rebalance else '关闭'}")
